@@ -10,12 +10,37 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from xcore.kernel.api import AuthPayload, get_current_user
+from xcore.kernel.api.auth import get_auth_backend
 
 from ..providers.base import OAuthProvider
+from ..services.events import XAuthEvents
 from ..services.oauth import OAuthService
 from ..services.token import TokenService
 
 _logger = logging.getLogger(__name__)
+
+
+async def _optional_user(request: Request) -> AuthPayload | None:
+    """
+    Variante non-bloquante de xcore.kernel.api.rbac._resolve_user (celle
+    dont get_current_user dépend) : retourne None plutôt que 401 quand
+    aucun token n'est présent — authorize() doit rester utilisable SANS
+    authentification pour un login initial (api/index.ts::auth.oauthUrl,
+    direct=true, simple clic sans fetch préalable, donc sans aucun header
+    Authorization). Réutilise le même AuthBackend (extract_token/
+    decode_token) que get_current_user pour rester cohérent avec le reste
+    de l'authentification — pas de logique de décodage dupliquée ici.
+    """
+    cached = getattr(request.state, "user", None)
+    if cached is not None:
+        return cached
+    backend = get_auth_backend()
+    if backend is None:
+        return None
+    token = await backend.extract_token(request)
+    if token is None:
+        return None
+    return await backend.decode_token(token)
 
 
 class OAuthLinkRequest(BaseModel):
@@ -30,6 +55,7 @@ def oauth_router(
     providers: dict[str, OAuthProvider],
     web_app_url: str = "http://localhost:8000",
     redirect_origins: list[str] | None = None,
+    events: XAuthEvents | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/oauth", tags=["oauth"])
     default_redirect = f"{web_app_url.rstrip('/')}/auth"
@@ -73,9 +99,12 @@ def oauth_router(
     @router.get("/{provider}/authorize")
     async def authorize(
         provider: str,
+        request: Request,
         tenant_id: str | None = None,
         redirect: str | None = None,
         direct: bool = False,
+        link_user_id: str | None = None,
+        extra_scopes: str | None = None,
     ) -> Any:
         """
         Sans `direct` : retourne l'URL d'autorisation en JSON (utilisé par
@@ -87,17 +116,43 @@ def oauth_router(
         auth.oauthUrl, `window.location.href = ...` sans fetch intermédiaire
         : un simple JSON ici afficherait le texte brut dans l'onglet au lieu
         d'atteindre GitHub).
+
+        `link_user_id` (présence seule compte, PAS sa valeur — voir
+        api/index.ts::oauth.startLink/github.linkViaOAuth, qui envoient déjà
+        littéralement `link_user_id=1`) + `extra_scopes` (ex: "repo") :
+        liaison de scope étendu sur le compte déjà connecté, PAS un login.
+        L'identité utilisée est TOUJOURS celle du Bearer token de CETTE
+        requête (_optional_user, jamais le user_id fourni par le client) —
+        sans ça n'importe qui pourrait forger `link_user_id=<tiers>` et lier
+        son propre token GitHub au compte d'un tiers. C'est pour ça que
+        startLink/linkViaOAuth passent déjà par un fetch authentifié
+        (call()) avant de naviguer vers auth_url, plutôt que par une
+        navigation top-level directe — sans token présent ici, 401.
         """
         # `redirect` est validé ici (pas seulement au callback) : c'est la
         # valeur persistée dans le state Redis et relue telle quelle par
         # handle_callback, donc le seul moment où on peut refuser une
         # origine hors allowlist plutôt que de la faire transiter en confiance.
         safe_redirect = _safe_redirect(redirect) if redirect else None
+        resolved_link_user_id: str | None = None
+        if link_user_id:
+            user = await _optional_user(request)
+            if user is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentification requise pour lier un compte.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            resolved_link_user_id = user["sub"]
         async with db.session() as session:
             svc = _svc(session)
             try:
                 url = await svc.get_auth_url(
-                    provider, tenant_id=tenant_id, post_login_redirect=safe_redirect
+                    provider,
+                    tenant_id=tenant_id,
+                    post_login_redirect=safe_redirect,
+                    link_user_id=resolved_link_user_id,
+                    extra_scopes=extra_scopes,
                 )
                 if direct:
                     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
@@ -146,6 +201,32 @@ def oauth_router(
                 )
 
         target = _safe_redirect(result.get("post_login_redirect"))
+
+        if result.get("linked_scope"):
+            # Liaison de scope étendu, pas un login — pas de nouvelle
+            # session, le navigateur garde les tokens de la session en
+            # cours. On notifie les abonnés (ex: marketplace, voir
+            # handle_oauth_linked côté marketplace) puis on redirige avec un
+            # simple indicateur de succès, jamais avec access_token/
+            # refresh_token (aucun n'a été émis ici).
+            if events is not None:
+                try:
+                    await events.oauth_linked(
+                        user_id=result["user_id"],
+                        provider=result["provider"],
+                        access_token=result.get("access_token"),
+                        scopes=result.get("scopes"),
+                    )
+                except Exception:
+                    _logger.exception(
+                        "[oauth] émission xauth.oauth.linked échouée (user_id=%s)",
+                        result.get("user_id"),
+                    )
+            return RedirectResponse(
+                f"{target}?{urlencode({'linked': provider})}",
+                status_code=status.HTTP_302_FOUND,
+            )
+
         params: dict[str, str] = {}
         if result.get("access_token"):
             params["access_token"] = result["access_token"]

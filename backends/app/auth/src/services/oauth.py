@@ -60,6 +60,8 @@ class OAuthService:
         provider_name: str,
         tenant_id: Optional[str] = None,
         post_login_redirect: Optional[str] = None,
+        link_user_id: Optional[str] = None,
+        extra_scopes: Optional[str] = None,
     ) -> str:
         provider = self.get_provider(provider_name)
 
@@ -68,6 +70,12 @@ class OAuthService:
             "provider": provider_name,
             "tenant_id": tenant_id,
             "redirect": post_login_redirect,
+            # link_user_id vient TOUJOURS du Bearer token de la requête
+            # authorize() elle-même (routes/oauth.py::_optional_user) —
+            # jamais d'un paramètre client brut. Voir authorize() pour le
+            # pourquoi complet.
+            "link_user_id": link_user_id,
+            "extra_scopes": extra_scopes,
         }
         # Le backend cache (RedisCacheBackend/MemoryBackend, voir
         # xcore.services.cache.backends) fait déjà la sérialisation JSON en
@@ -86,7 +94,17 @@ class OAuthService:
             state_data,
             ttl=_STATE_TTL,
         )
-        return provider.get_auth_url(state)
+        extra_params = None
+        if extra_scopes:
+            # Fusionne avec les scopes par défaut du provider plutôt que de
+            # les remplacer — sinon on perd read:user/user:email dont
+            # get_user_info() a besoin pour un login normal (non pertinent
+            # ici puisque ce flow saute _find_or_create_user, mais mieux
+            # vaut ne jamais réduire silencieusement ce qui est demandé).
+            requested = extra_scopes.replace(",", " ").split()
+            merged = list(dict.fromkeys([*provider.scopes, *requested]))
+            extra_params = {"scope": " ".join(merged)}
+        return provider.get_auth_url(state, extra_params=extra_params)
 
     # ── Step 2 : callback — échange le code, trouve ou crée le user ──────────
 
@@ -114,6 +132,27 @@ class OAuthService:
         access_token = token_data.get("access_token")
         if not access_token:
             raise ValueError(f"Le provider n'a pas retourné d'access_token : {token_data}")
+
+        # ── Liaison de scope étendu — pas un login ──────────────────────────
+        # link_user_id vient toujours du Bearer token de la requête
+        # authorize() elle-même (routes/oauth.py::_optional_user) : jamais
+        # un paramètre client brut. Pas de find-or-create, pas de nouvelle
+        # Session/JWT — l'utilisateur est
+        # déjà connecté ailleurs, ce flow ne fait qu'obtenir un token
+        # provider avec le scope demandé (ex: "repo") pour SON compte. Le
+        # routeur (routes/oauth.py::callback) émet xauth.oauth.linked avec
+        # ce résultat pour que marketplace (ou tout autre plugin abonné)
+        # puisse s'en servir sans redemander un Personal Access Token.
+        link_user_id = state_data.get("link_user_id")
+        if link_user_id:
+            return {
+                "linked_scope": True,
+                "provider": provider_name,
+                "user_id": link_user_id,
+                "access_token": access_token,
+                "scopes": token_data.get("scope"),
+                "post_login_redirect": state_data.get("redirect"),
+            }
 
         # Récupérer le profil utilisateur
         user_info = await provider.get_user_info(access_token)
